@@ -28,7 +28,6 @@ public:
         target_table = ch_config["table"];
     }
 
-    // 获取列表逻辑
     std::vector<std::string> fetch_stock_list() {
         std::vector<std::string> codes;
         json body = {
@@ -53,7 +52,6 @@ public:
         return codes;
     }
 
-    // 同步单只股票
     void sync_daily(const std::string& ts_code, const std::string& start, const std::string& end) {
         json body = {
             {"api_name", "daily"},
@@ -62,7 +60,6 @@ public:
         };
 
         std::string resp = post_request(body.dump());
-        // 【关键调试点】打印原始返回，看看到底是空数据还是报错
         std::cout << "DEBUG [" << ts_code << "] Resp: " << resp << std::endl; 
         
         auto j = json::parse(resp);
@@ -75,7 +72,6 @@ public:
         auto& items = j["data"]["items"];
         Block block;
 
-        // 对应 DBeaver 截图中的 12 个字段
         auto c_code  = std::make_shared<ColumnString>();
         auto c_date  = std::make_shared<ColumnString>();
         auto c_open  = std::make_shared<ColumnFloat64>();
@@ -190,7 +186,7 @@ int main() {
         for (size_t i = 0; i < stocks.size(); ++i) {
             std::cout << "[" << i + 1 << "/" << stocks.size() << "] Syncing " << stocks[i] << "..." << std::endl;
             syncer.sync_daily(stocks[i], "20240101", "20241231");
-            std::this_thread::sleep_for(std::chrono::milliseconds(800)); // 加大延迟保护账号
+            std::this_thread::sleep_for(std::chrono::milliseconds(800));
         }
         std::cout << "Process Done." << std::endl;
     } catch (const std::exception& e) {
