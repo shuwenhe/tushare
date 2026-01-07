@@ -1,151 +1,201 @@
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <vector>
-#include <map>
-#include <ctime>
+#include <cstdlib>
+#include <thread>
+#include <chrono>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <clickhouse/client.h>
-#include <clickhouse/columns/numeric.h>
-#include <clickhouse/columns/string.h>
 
 using json = nlohmann::json;
 using namespace clickhouse;
 
-// ---------------- 数据结构 ----------------
-struct StockDay {
-    std::string ts_code;
-    std::string trade_date;
-    double open, high, low, close, pre_close, change, pct_chg, vol, amount;
-    double date_stamp;
-};
-
-// ---------------- 工具函数 ----------------
-size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
-    ((std::string*)userp)->append((char*)contents, size * nmemb);
-    return size * nmemb;
-}
-
-double cover_time(const std::string& date_str) {
-    struct tm tm = {0};
-    if (strptime(date_str.c_str(), "%Y%m%d", &tm) == nullptr) return 0;
-    return (double)mktime(&tm);
-}
-
-// ---------------- 核心同步类 ----------------
-class TushareSync {
+class TushareSyncer {
 public:
-    TushareSync(std::string ts_token, const std::string& ch_host) : token(ts_token) {
+    TushareSyncer() {
+        token = load_token_from_home();
+        load_ch_config();
+
         ClientOptions options;
-        options.SetHost(ch_host).SetUser("quant").SetPassword("quant").SetDefaultDatabase("quant");
+        options.SetHost(ch_config["host"])
+               .SetUser(ch_config["user"])
+               .SetPassword(ch_config["password"])
+               .SetDefaultDatabase(ch_config["database"]);
+        
         ch_client = std::make_unique<Client>(options);
+        target_table = ch_config["table"];
     }
 
-    void sync_daily(std::string ts_code, std::string start_date, std::string end_date) {
-        std::string url = "https://api.tushare.pro";
+    // 获取列表逻辑
+    std::vector<std::string> fetch_stock_list() {
+        std::vector<std::string> codes;
+        json body = {
+            {"api_name", "stock_basic"},
+            {"token", token},
+            {"params", {{"list_status", "L"}, {"fields", "ts_code"}}}
+        };
+
+        std::string resp = post_request(body.dump());
+        auto j = json::parse(resp);
+
+        if (j.contains("code") && j["code"].get<int>() != 0) {
+            std::cerr << "[Tushare Error] " << j["msg"] << " (Code: " << j["code"] << ")" << std::endl;
+            return codes;
+        }
+
+        if (j.contains("data") && j["data"].contains("items")) {
+            for (auto& row : j["data"]["items"]) {
+                codes.push_back(row[0].get<std::string>());
+            }
+        }
+        return codes;
+    }
+
+    // 同步单只股票
+    void sync_daily(const std::string& ts_code, const std::string& start, const std::string& end) {
         json body = {
             {"api_name", "daily"},
             {"token", token},
-            {"params", {{"ts_code", ts_code}, {"start_date", start_date}, {"end_date", end_date}}}
+            {"params", {{"ts_code", ts_code}, {"start_date", start}, {"end_date", end}}}
         };
 
-        std::string resp_str = post_request(url, body.dump());
-        auto resp_json = json::parse(resp_str);
+        std::string resp = post_request(body.dump());
+        // 【关键调试点】打印原始返回，看看到底是空数据还是报错
+        std::cout << "DEBUG [" << ts_code << "] Resp: " << resp << std::endl; 
+        
+        auto j = json::parse(resp);
 
-        if (resp_json["code"] != 0) {
-            std::cerr << "Tushare Error: " << resp_json["msg"] << std::endl;
+        if (!j.contains("data") || j["data"]["items"].is_null() || j["data"]["items"].empty()) {
+            std::cout << " -> No valid items in response for " << ts_code << std::endl;
             return;
         }
 
-        auto& data_part = resp_json["data"];
-        auto& items = data_part["items"];
-        
-        std::vector<StockDay> batch;
+        auto& items = j["data"]["items"];
+        Block block;
+
+        // 对应 DBeaver 截图中的 12 个字段
+        auto c_code  = std::make_shared<ColumnString>();
+        auto c_date  = std::make_shared<ColumnString>();
+        auto c_open  = std::make_shared<ColumnFloat64>();
+        auto c_high  = std::make_shared<ColumnFloat64>();
+        auto c_low   = std::make_shared<ColumnFloat64>();
+        auto c_close = std::make_shared<ColumnFloat64>();
+        auto c_pre   = std::make_shared<ColumnFloat64>();
+        auto c_chg   = std::make_shared<ColumnFloat64>();
+        auto c_pct   = std::make_shared<ColumnFloat64>();
+        auto c_vol   = std::make_shared<ColumnFloat64>();
+        auto c_amt   = std::make_shared<ColumnFloat64>();
+        auto c_stamp = std::make_shared<ColumnFloat64>();
+
         for (auto& row : items) {
-            StockDay sd;
-            sd.ts_code    = row[0].get<std::string>();
-            sd.trade_date = row[1].get<std::string>();
-            sd.open       = row[2].get<double>();
-            sd.high       = row[3].get<double>();
-            sd.low        = row[4].get<double>();
-            sd.close      = row[5].get<double>();
-            sd.pre_close  = row[6].get<double>();
-            sd.change     = row[7].get<double>();
-            sd.pct_chg    = row[8].get<double>();
-            sd.vol        = row[9].get<double>();
-            sd.amount     = row[10].get<double>();
-            sd.date_stamp = cover_time(sd.trade_date);
-            batch.push_back(sd);
+            std::string date_str = row[1].get<std::string>();
+            c_code->Append(row[0].get<std::string>());
+            c_date->Append(date_str);
+            c_open->Append(row[2].get<double>());
+            c_high->Append(row[3].get<double>());
+            c_low->Append(row[4].get<double>());
+            c_close->Append(row[5].get<double>());
+            c_pre->Append(row[6].get<double>());
+            c_chg->Append(row[7].get<double>());
+            c_pct->Append(row[8].get<double>());
+            c_vol->Append(row[9].get<double>());
+            c_amt->Append(row[10].get<double>());
+            c_stamp->Append(convert_to_stamp(date_str));
         }
 
-        write_to_clickhouse(batch);
+        block.AppendColumn("ts_code",    c_code);
+        block.AppendColumn("trade_date", c_date);
+        block.AppendColumn("open",       c_open);
+        block.AppendColumn("high",       c_high);
+        block.AppendColumn("low",        c_low);
+        block.AppendColumn("close",      c_close);
+        block.AppendColumn("pre_close",  c_pre);
+        block.AppendColumn("change",     c_chg);
+        block.AppendColumn("pct_chg",    c_pct);
+        block.AppendColumn("vol",        c_vol);
+        block.AppendColumn("amount",     c_amt);
+        block.AppendColumn("date_stamp", c_stamp);
+
+        try {
+            ch_client->Insert(target_table, block);
+            std::cout << " -> Successfully inserted " << items.size() << " rows." << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << " -> ClickHouse Insert Error: " << e.what() << std::endl;
+        }
     }
 
 private:
     std::string token;
+    json ch_config;
+    std::string target_table;
     std::unique_ptr<Client> ch_client;
 
-    std::string post_request(const std::string& url, const std::string& json_payload) {
+    void load_ch_config() {
+        std::ifstream f("config.json");
+        if (!f.is_open()) throw std::runtime_error("Missing config.json");
+        json j; f >> j;
+        ch_config = j.at("clickhouse");
+    }
+
+    std::string load_token_from_home() {
+        const char* home = std::getenv("HOME");
+        std::string path = std::string(home) + "/.tushare_config.json";
+        std::ifstream f(path);
+        if (!f.is_open()) throw std::runtime_error("Missing ~/.tushare_config.json");
+        json j; f >> j;
+        return j.at("token").get<std::string>();
+    }
+
+    static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+        ((std::string*)userp)->append((char*)contents, size * nmemb);
+        return size * nmemb;
+    }
+
+    std::string post_request(const std::string& payload) {
         CURL* curl = curl_easy_init();
         std::string buffer;
         if (curl) {
-            struct curl_slist* headers = nullptr;
-            headers = curl_slist_append(headers, "Content-Type: application/json");
-            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+            struct curl_slist* headers = curl_slist_append(nullptr, "Content-Type: application/json");
+            curl_easy_setopt(curl, CURLOPT_URL, "https://api.tushare.pro");
             curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_payload.c_str());
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
             curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
             curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
             curl_easy_perform(curl);
             curl_easy_cleanup(curl);
+            curl_slist_free_all(headers);
         }
         return buffer;
     }
 
-    void write_to_clickhouse(const std::vector<StockDay>& batch) {
-        if (batch.empty()) return;
-
-        Block block;
-        auto c_code = std::make_shared<ColumnString>();
-        auto c_date = std::make_shared<ColumnString>();
-        auto c_open = std::make_shared<ColumnFloat64>();
-        auto c_high = std::make_shared<ColumnFloat64>();
-        auto c_low = std::make_shared<ColumnFloat64>();
-        auto c_close = std::make_shared<ColumnFloat64>();
-        auto c_vol = std::make_shared<ColumnFloat64>();
-        auto c_stamp = std::make_shared<ColumnFloat64>();
-
-        for (auto& d : batch) {
-            c_code->Append(d.ts_code);
-            c_date->Append(d.trade_date);
-            c_open->Append(d.open);
-            c_high->Append(d.high);
-            c_low->Append(d.low);
-            c_close->Append(d.close);
-            c_vol->Append(d.vol);
-            c_stamp->Append(d.date_stamp);
-        }
-
-        block.AppendColumn("ts_code", c_code);
-        block.AppendColumn("trade_date", c_date);
-        block.AppendColumn("open", c_open);
-        block.AppendColumn("high", c_high);
-        block.AppendColumn("low", c_low);
-        block.AppendColumn("close", c_close);
-        block.AppendColumn("vol", c_vol);
-        block.AppendColumn("date_stamp", c_stamp);
-
-        ch_client->Insert("stock_day_data", block);
-        std::cout << "Successfully inserted " << batch.size() << " rows." << std::endl;
+    double convert_to_stamp(const std::string& d) {
+        struct tm tm = {0};
+        if (strptime(d.c_str(), "%Y%m%d", &tm) == nullptr) return 0;
+        return (double)mktime(&tm);
     }
 };
 
 int main() {
-    // 替换为你的真实 Token
-    TushareSync sync("YOUR_TUSHARE_TOKEN_HERE", "127.0.0.1");
+    try {
+        TushareSyncer syncer;
+        auto stocks = syncer.fetch_stock_list();
+        
+        if (stocks.empty()) {
+            std::cout << "Fallback to test codes..." << std::endl;
+            stocks = {"000001.SZ", "600519.SH"};
+        }
 
-    std::cout << "Starting sync for 000001.SZ (平安银行)..." << std::endl;
-    sync.sync_daily("000001.SZ", "20240101", "20241231");
-
+        for (size_t i = 0; i < stocks.size(); ++i) {
+            std::cout << "[" << i + 1 << "/" << stocks.size() << "] Syncing " << stocks[i] << "..." << std::endl;
+            syncer.sync_daily(stocks[i], "20240101", "20241231");
+            std::this_thread::sleep_for(std::chrono::milliseconds(800)); // 加大延迟保护账号
+        }
+        std::cout << "Process Done." << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Main Error: " << e.what() << std::endl;
+        return 1;
+    }
     return 0;
 }
