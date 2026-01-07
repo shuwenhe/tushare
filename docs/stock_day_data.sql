@@ -1,5 +1,3 @@
-CREATE DATABASE IF NOT EXISTS quant;
-
 CREATE TABLE quant.stock_day_data (
     ts_code String,
     trade_date String,
